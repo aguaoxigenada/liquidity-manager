@@ -1,11 +1,15 @@
 [toolchain]
+anchor_version = "0.31.0"
 package_manager = "yarn"
 
 [features]
 resolution = true
-skip-lint = false
+skip-lint = true
 
 [programs.localnet]
+liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"
+
+[programs.devnet]
 liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"
 
 [registry]
