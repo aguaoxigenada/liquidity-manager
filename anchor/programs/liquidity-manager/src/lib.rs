@@ -2,6 +2,8 @@ use anchor_lang::{prelude::*, solana_program::{instruction::Instruction, program
 use anchor_spl::{
     associated_token::AssociatedToken, token::{Mint, Token, TokenAccount}, token_interface::spl_pod::bytemuck 
 };
+use anchor_lang::solana_program::account_info::AccountInfo;
+use std::convert::TryFrom;
 use ::bytemuck::{Pod, Zeroable};
 use bytemuck::{pod_maybe_from_bytes, pod_from_bytes};
 
@@ -62,8 +64,31 @@ pub mod liquidity_manager {
             ctx.accounts.manager.current_liquidity
         )?;
 
-        swap_to_target_ratio(&ctx, current_tick)?;
-        
+        /*
+        swap_to_target_ratio(
+            ctx, 
+            current_tick
+        );
+         */
+
+         let swap_ix = jupiter_swap_instruction(
+            &ctx.accounts.token_vault_a.key(),
+            &ctx.accounts.token_vault_b.key(),
+            ctx.accounts.token_vault_a.amount, // Swap 100% of Token A
+            1,                                // Minimum out (adjust for slippage)
+            ctx.accounts.jupiter_program.key(),
+        )?;
+
+         // 2. Execute swap
+        invoke(
+            &swap_ix,
+            &[
+                ctx.accounts.token_vault_a.to_account_info(),
+                ctx.accounts.token_vault_b.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+
         // 3. Calculate new ticks (centered around current price)
         let new_lower_tick = current_tick - 100;
         let new_upper_tick = current_tick + 100;
@@ -222,10 +247,47 @@ fn remove_liquidity(
     Ok(())
 }
 
-fn swap_to_target_ratio(ctx: &Context<Rebalance>, target_tick: i32) -> Result<()> {
-    // Use Jupiter CPI or Raydium swap
-    // Calculate swap amount based on tick
+pub fn swap_to_target_ratio(
+    ctx: Context<Rebalance>,
+    swap_ix_data: Vec<u8>,
+) -> Result<()> {
+    invoke(
+        &Instruction {
+            program_id: ctx.accounts.jupiter_program.key(),
+            accounts: ctx.remaining_accounts.iter()
+                .map(|a| AccountMeta {
+                    pubkey: a.key(),
+                    is_signer: a.is_signer,
+                    is_writable: a.is_writable,
+                })
+                .collect(),
+            data: swap_ix_data,
+        },
+        ctx.remaining_accounts,
+    )?;
     Ok(())
+}
+
+fn jupiter_swap_instruction(
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: u64,
+    min_amount_out: u64,
+    jupiter_program: Pubkey,
+) -> Result<Instruction> {
+    let mut data = vec![0x01]; // Jupiter swap instruction discriminator
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+    Ok(Instruction {
+        program_id: jupiter_program,
+        accounts: vec![
+            AccountMeta::new(*input_mint, false),
+            AccountMeta::new(*output_mint, false),
+            // Add other required accounts (user, token program, etc.)
+        ],
+        data,
+    })
 }
 
 #[account]
@@ -352,5 +414,7 @@ pub enum LiquidityManagerError {
     #[msg("The Pool Data is invalid")]
     InvalidPoolData,
     #[msg("")]
-    CalculationOverflow
+    CalculationOverflow,
+    #[msg("No Account Found")]
+    AccountNotFound
 }
