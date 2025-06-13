@@ -373,7 +373,7 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + 32 + 32 + 32 + 32 + 32 + 4 + 4,
+        space = 8 + 32 + 32 + 32 + 32 + 32 + 4 + 4 + 16,
         seeds = [b"manager", pool.key().as_ref()],
         bump
     )]
