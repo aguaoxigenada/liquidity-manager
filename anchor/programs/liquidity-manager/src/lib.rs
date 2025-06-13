@@ -3,9 +3,8 @@ use anchor_spl::{
     associated_token::AssociatedToken, token::{Mint, Token, TokenAccount}, token_interface::spl_pod::bytemuck 
 };
 use anchor_lang::solana_program::account_info::AccountInfo;
-use std::convert::TryFrom;
 use ::bytemuck::{Pod, Zeroable};
-use bytemuck::{pod_maybe_from_bytes, pod_from_bytes};
+use bytemuck::{pod_from_bytes};
 
 pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey = pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");  // Should be in an .env
 
@@ -103,9 +102,12 @@ pub mod liquidity_manager {
             new_upper_tick,
             token_a_amount,
             token_b_amount,
-            current_tick
+            current_tick,
+            ctx.accounts.token_mint_a.decimals, // Add token A decimals
+            ctx.accounts.token_mint_b.decimals, // Add token B decimals
         )?;
-    
+
+
         // 6. Add 10% slippage buffer
         let token_a_max = token_a_amount.checked_mul(110).unwrap() / 100;
         let token_b_max = token_b_amount.checked_mul(110).unwrap() / 100;
@@ -192,12 +194,76 @@ fn calculate_liquidity(
     upper_tick: i32,
     amount_a: u64,
     amount_b: u64,
-    current_tick: i32
+    current_tick: i32,
+    token_a_decimals: u8,
+    token_b_decimals: u8,
 ) -> Result<u128> {
-    // In production, use Raydium's SDK formulas
-    let liquidity = (amount_a as u128).checked_add(amount_b as u128)
-        .ok_or(LiquidityManagerError::CalculationOverflow)?;
-    Ok(liquidity)
+    // 1. Convert ticks to sqrt prices
+    let sqrt_price_lower = tick_to_sqrt_price(lower_tick)?;
+    let sqrt_price_upper = tick_to_sqrt_price(upper_tick)?;
+    let sqrt_price_current = tick_to_sqrt_price(current_tick)?;
+
+    // 2. Adjust amounts for decimals
+    let amount_a = adjust_for_decimals(amount_a, token_a_decimals)?;
+    let amount_b = adjust_for_decimals(amount_b, token_b_decimals)?;
+
+    // 3. Calculate liquidity based on position relative to current tick
+    if current_tick < lower_tick {
+        // Position is entirely in token B (right of range)
+        Ok(calculate_liquidity_b(
+            amount_b,
+            sqrt_price_lower,
+            sqrt_price_upper
+        )?)
+    } else if current_tick >= upper_tick {
+        // Position is entirely in token A (left of range)
+        Ok(calculate_liquidity_a(
+            amount_a,
+            sqrt_price_lower,
+            sqrt_price_upper
+        )?)
+    } else {
+        // Position is active (within range)
+        Ok(std::cmp::min(
+            calculate_liquidity_a(amount_a, sqrt_price_current, sqrt_price_upper)?,
+            calculate_liquidity_b(amount_b, sqrt_price_lower, sqrt_price_current)?,
+        ))
+    }
+}
+
+
+/// Converts tick to sqrt price (Q64.64 fixed point)
+fn tick_to_sqrt_price(tick: i32) -> Result<u128> {
+    // Raydium uses Q64.64 fixed point sqrt price
+    let sqrt_price = (1.0001f64.powi(tick)).sqrt();
+    Ok((sqrt_price * (1u128 << 64) as f64) as u128)
+}
+
+/// Calculates liquidity when position is all token A
+fn calculate_liquidity_a(amount_a: u128, sqrt_price_low: u128, sqrt_price_high: u128) -> Result<u128> {
+    let sqrt_diff = sqrt_price_high.checked_sub(sqrt_price_low)
+        .ok_or(LiquidityManagerError::InvalidTickRange)?;
+    
+    amount_a
+        .checked_mul(sqrt_price_high)
+        .and_then(|v| v.checked_mul(sqrt_price_low))
+        .and_then(|v| v.checked_div(sqrt_diff))
+        .ok_or(LiquidityManagerError::CalculationOverflow.into())
+}
+
+fn calculate_liquidity_b(amount_b: u128, sqrt_price_low: u128, sqrt_price_high: u128) -> Result<u128> {
+    let sqrt_diff = sqrt_price_high.checked_sub(sqrt_price_low)
+        .ok_or(LiquidityManagerError::InvalidTickRange)?;
+    
+    amount_b
+        .checked_mul(1u128 << 64)
+        .and_then(|v| v.checked_div(sqrt_diff))
+        .ok_or(LiquidityManagerError::CalculationOverflow.into())
+}
+
+/// Adjusts token amount for decimals (convert to native units)
+fn adjust_for_decimals(amount: u64, decimals: u8) -> Result<u128> {
+    Ok(amount as u128 * 10u128.pow(decimals as u32))
 }
 
 fn remove_liquidity(
@@ -390,10 +456,26 @@ pub struct Rebalance<'info> {
     #[account(mut)]
     pub pool_token_vault_b: AccountInfo<'info>,
     
+    // Token Mints
+    #[account(
+        address = manager.token_mint_a,
+        constraint = token_vault_a.mint == token_mint_a.key()
+    )]
+    pub token_mint_a: Box<Account<'info, Mint>>,
+
+    #[account(
+        address = manager.token_mint_b,
+        constraint = token_vault_b.mint == token_mint_b.key()
+    )]
+    pub token_mint_b: Box<Account<'info, Mint>>,
+
     // External Programs
     pub raydium_program: AccountInfo<'info>,
     pub jupiter_program: AccountInfo<'info>,
+
+
 }
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct RaydiumPoolState {
@@ -416,5 +498,7 @@ pub enum LiquidityManagerError {
     #[msg("")]
     CalculationOverflow,
     #[msg("No Account Found")]
-    AccountNotFound
+    AccountNotFound,
+    #[msg("Tick is in invalid Range")]
+    InvalidTickRange
 }
