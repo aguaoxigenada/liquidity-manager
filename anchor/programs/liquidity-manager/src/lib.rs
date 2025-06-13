@@ -57,6 +57,13 @@ pub mod liquidity_manager {
             LiquidityManagerError::NoRebalanceNeeded
         );
     
+        remove_liquidity(
+            &ctx,
+            ctx.accounts.manager.current_liquidity
+        )?;
+
+        swap_to_target_ratio(&ctx, current_tick)?;
+        
         // 3. Calculate new ticks (centered around current price)
         let new_lower_tick = current_tick - 100;
         let new_upper_tick = current_tick + 100;
@@ -65,7 +72,7 @@ pub mod liquidity_manager {
         let token_a_amount = ctx.accounts.token_vault_a.amount;
         let token_b_amount = ctx.accounts.token_vault_b.amount;
     
-        // 5. Calculate liquidity parameters (simplified)
+        // 5. Calculate liquidity parameters
         let liquidity = calculate_liquidity(
             new_lower_tick,
             new_upper_tick,
@@ -168,26 +175,58 @@ fn calculate_liquidity(
     Ok(liquidity)
 }
 
-/*
-fn remove_liquidity_cpi(ctx: &Context<Rebalance>) -> Result<()> {
-    let cpi_program = ctx.accounts.raydium_clmm_program.to_account_info();
+fn remove_liquidity(
+    ctx: &Context<Rebalance>,
+    liquidity_to_remove: u128
+) -> Result<()> {
+    // 1. Prepare instruction data
+    let mut data = Vec::new();
+    data.push(0x03); // DecreaseLiquidity discriminator
+    data.extend_from_slice(&liquidity_to_remove.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // token_min_a
+    data.extend_from_slice(&0u64.to_le_bytes()); // token_min_b
 
-    let cpi_accounts = raydium_clmm::cpi::accounts::DecreaseLiquidity {
-        pool: ctx.accounts.pool.to_account_info(),
-        position_nft: ctx.accounts.position_nft.to_account_info(),
-        vault_a: ctx.accounts.vault_token_a.to_account_info(),
-        vault_b: ctx.accounts.vault_token_b.to_account_info(),
-        token_program: ctx.accounts.token_program.to_account_info(),
-        
+    // 2. Build instruction
+    let ix = Instruction {
+        program_id: RAYDIUM_CLMM_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(ctx.accounts.pool.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.executor.key(), true),
+            AccountMeta::new(ctx.accounts.position_nft.key(), false),
+            AccountMeta::new(ctx.accounts.position_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.token_vault_a.key(), false),
+            AccountMeta::new(ctx.accounts.token_vault_b.key(), false),
+            AccountMeta::new(ctx.accounts.pool_token_vault_a.key(), false),
+            AccountMeta::new(ctx.accounts.pool_token_vault_b.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ],
+        data,
     };
 
-    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-    raydium_clmm::cpi::decrease_liquidity(cpi_ctx)?;
+    // 3. Execute CPI
+    invoke(
+        &ix,
+        &[
+            ctx.accounts.pool.to_account_info(),
+            ctx.accounts.executor.to_account_info(),
+            ctx.accounts.position_nft.to_account_info(),
+            ctx.accounts.position_token_account.to_account_info(),
+            ctx.accounts.token_vault_a.to_account_info(),
+            ctx.accounts.token_vault_b.to_account_info(),
+            ctx.accounts.pool_token_vault_a.to_account_info(),
+            ctx.accounts.pool_token_vault_b.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ],
+    )?;
 
     Ok(())
 }
- */
+
+fn swap_to_target_ratio(ctx: &Context<Rebalance>, target_tick: i32) -> Result<()> {
+    // Use Jupiter CPI or Raydium swap
+    // Calculate swap amount based on tick
+    Ok(())
+}
 
 #[account]
 pub struct LiquidityManager {
@@ -198,6 +237,7 @@ pub struct LiquidityManager {
     pub token_mint_b: Pubkey,  // USDC mint
     pub lower_tick: i32,
     pub upper_tick: i32,
+    pub current_liquidity: u128,
 }
 
 #[derive(Accounts)]
@@ -238,33 +278,6 @@ pub struct Initialize<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
-/*
-#[derive(Accounts)]
-pub struct AddLiquidityAccounts<'info> {
-    pub raydium_program: AccountInfo<'info>,
-    #[account(mut)]
-    pub pool: AccountInfo<'info>,
-    #[account(mut)]
-    pub position_nft_mint: AccountInfo<'info>,
-    #[account(mut)]
-    pub position_token_account: AccountInfo<'info>,
-    pub tick_array_lower: AccountInfo<'info>,
-    pub tick_array_upper: AccountInfo<'info>,
-    #[account(mut)]
-    pub token_vault_a: AccountInfo<'info>,
-    #[account(mut)]
-    pub token_vault_b: AccountInfo<'info>,
-    #[account(mut)]
-    pub token_owner_account_a: AccountInfo<'info>,
-    #[account(mut)]
-    pub token_owner_account_b: AccountInfo<'info>,
-    pub position_authority: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-*/
-
 #[derive(Accounts)]
 pub struct UpdateRange<'info> {
     #[account(mut, has_one = authority)]
@@ -274,39 +287,51 @@ pub struct UpdateRange<'info> {
 
 #[derive(Accounts)]
 pub struct Rebalance<'info> {
+    // Core Program Accounts
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+    
+    // Authority Accounts
     #[account(mut, has_one = executor)]
     pub manager: Account<'info, LiquidityManager>,
-    // Executor wallet (bot) must sign
     pub executor: Signer<'info>,
-
+    pub position_authority: Signer<'info>,
+    
+    // Pool & Position Accounts
     #[account(mut)]
     pub pool: AccountInfo<'info>,
-    // Token vaults
     #[account(mut)]
-    pub token_vault_a: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub token_vault_b: Account<'info, TokenAccount>,
-    // Programs for CPIs
-    pub token_program: Program<'info, Token>,
-    pub raydium_program: AccountInfo<'info>,
-    pub jupiter_program: AccountInfo<'info>,
-
+    pub position_nft: AccountInfo<'info>,
     #[account(mut)]
     pub position_nft_mint: AccountInfo<'info>,
     #[account(mut)]
     pub position_token_account: AccountInfo<'info>,
+    
+    // Tick Arrays
     pub tick_array_lower: AccountInfo<'info>,
     pub tick_array_upper: AccountInfo<'info>,
-
+    
+    // Token Vaults (Yours)
+    #[account(mut)]
+    pub token_vault_a: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub token_vault_b: Account<'info, TokenAccount>,
     #[account(mut)]
     pub token_owner_account_a: AccountInfo<'info>,
     #[account(mut)]
     pub token_owner_account_b: AccountInfo<'info>,
-    pub position_authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
+    
+    // Pool Token Vaults (Raydium's)
+    #[account(mut)]
+    pub pool_token_vault_a: AccountInfo<'info>,
+    #[account(mut)]
+    pub pool_token_vault_b: AccountInfo<'info>,
+    
+    // External Programs
+    pub raydium_program: AccountInfo<'info>,
+    pub jupiter_program: AccountInfo<'info>,
 }
-
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct RaydiumPoolState {
