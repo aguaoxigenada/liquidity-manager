@@ -19,12 +19,19 @@ pub mod liquidity_manager {
         ctx: Context<Initialize>,
         lower_tick: i32,
         upper_tick: i32,
+        executor: Pubkey,
     ) -> Result<()> {
         let manager = &mut ctx.accounts.manager;
         manager.authority = *ctx.accounts.authority.key;
         manager.pool = ctx.accounts.pool.key();
+        manager.token_mint_a = ctx.accounts.token_mint_a.key(); 
+        manager.token_mint_b = ctx.accounts.token_mint_b.key(); 
+        manager.token_vault_a = ctx.accounts.token_vault_a.key(); 
+        manager.token_vault_b = ctx.accounts.token_vault_b.key(); 
         manager.lower_tick = lower_tick;
         manager.upper_tick = upper_tick;
+        manager.executor = executor;
+        manager.current_liquidity = 0; 
         
         // Token vaults are automatically created by Anchor via #[account(init)]
         msg!(
@@ -47,8 +54,13 @@ pub mod liquidity_manager {
     pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
         // 1. Get current pool state
         let pool_data = ctx.accounts.pool.try_borrow_data()?.to_vec();
+        msg!("Raw pool data length: {}", pool_data.len());
+
         let pool_state = pod_from_bytes::<RaydiumPoolState>(&pool_data)
-            .map_err(|_| error!(LiquidityManagerError::InvalidPoolData))?;
+        .map_err(|e| {
+            msg!("Deserialization failed at offset: {:?}", e);
+            LiquidityManagerError::InvalidPoolData
+        })?;
         let current_tick = pool_state.current_tick;
 
         // 2. Check if rebalance is needed
@@ -130,7 +142,40 @@ pub mod liquidity_manager {
         Ok(())
     }
     
+    pub fn fund_vaults(ctx: Context<FundVaults>, amount_a: u64, amount_b: u64) -> Result<()> {
+        // Transfer token A
+        anchor_spl::token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: ctx.accounts.payer_token_a.to_account_info(),
+                    to: ctx.accounts.vault_a.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            amount_a,
+        )?;
     
+        // Transfer token B
+        anchor_spl::token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: ctx.accounts.payer_token_b.to_account_info(),
+                    to: ctx.accounts.vault_b.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            amount_b,
+        )?;
+    
+        Ok(())
+    }
+}
+
+#[test]
+fn test_struct_size() {
+    println!("Struct size: {}", std::mem::size_of::<RaydiumPoolState>());
 }
 
 // revisar si esta funcion esta interna o externa.
@@ -229,6 +274,7 @@ fn calculate_liquidity(
             calculate_liquidity_b(amount_b, sqrt_price_lower, sqrt_price_current)?,
         ))
     }
+
 }
 
 
@@ -283,7 +329,7 @@ fn remove_liquidity(
         accounts: vec![
             AccountMeta::new(ctx.accounts.pool.key(), false),
             AccountMeta::new_readonly(ctx.accounts.executor.key(), true),
-            AccountMeta::new(ctx.accounts.position_nft.key(), false),
+            AccountMeta::new(ctx.accounts.position_nft_mint.key(), false),
             AccountMeta::new(ctx.accounts.position_token_account.key(), false),
             AccountMeta::new(ctx.accounts.token_vault_a.key(), false),
             AccountMeta::new(ctx.accounts.token_vault_b.key(), false),
@@ -300,7 +346,7 @@ fn remove_liquidity(
         &[
             ctx.accounts.pool.to_account_info(),
             ctx.accounts.executor.to_account_info(),
-            ctx.accounts.position_nft.to_account_info(),
+            ctx.accounts.position_nft_mint.to_account_info(),
             ctx.accounts.position_token_account.to_account_info(),
             ctx.accounts.token_vault_a.to_account_info(),
             ctx.accounts.token_vault_b.to_account_info(),
@@ -363,6 +409,8 @@ pub struct LiquidityManager {
     pub pool: Pubkey,          // Raydium CL pool address
     pub token_mint_a: Pubkey,  // SOL mint
     pub token_mint_b: Pubkey,  // USDC mint
+    pub token_vault_a: Pubkey, // Add this
+    pub token_vault_b: Pubkey, // Add this
     pub lower_tick: i32,
     pub upper_tick: i32,
     pub current_liquidity: u128,
@@ -373,7 +421,7 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + 32 + 32 + 32 + 32 + 32 + 4 + 4 + 16,
+        space = 8 + 32 * 7 + 4 * 2 + 16,
         seeds = [b"manager", pool.key().as_ref()],
         bump
     )]
@@ -419,27 +467,21 @@ pub struct Rebalance<'info> {
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
-    
     // Authority Accounts
     #[account(mut, has_one = executor)]
     pub manager: Account<'info, LiquidityManager>,
     pub executor: Signer<'info>,
     pub position_authority: Signer<'info>,
-    
     // Pool & Position Accounts
     #[account(mut)]
     pub pool: AccountInfo<'info>,
     #[account(mut)]
-    pub position_nft: AccountInfo<'info>,
-    #[account(mut)]
     pub position_nft_mint: AccountInfo<'info>,
     #[account(mut)]
     pub position_token_account: AccountInfo<'info>,
-    
     // Tick Arrays
     pub tick_array_lower: AccountInfo<'info>,
     pub tick_array_upper: AccountInfo<'info>,
-    
     // Token Vaults (Yours)
     #[account(mut)]
     pub token_vault_a: Account<'info, TokenAccount>,
@@ -449,13 +491,11 @@ pub struct Rebalance<'info> {
     pub token_owner_account_a: AccountInfo<'info>,
     #[account(mut)]
     pub token_owner_account_b: AccountInfo<'info>,
-    
     // Pool Token Vaults (Raydium's)
     #[account(mut)]
     pub pool_token_vault_a: AccountInfo<'info>,
     #[account(mut)]
     pub pool_token_vault_b: AccountInfo<'info>,
-    
     // Token Mints
     #[account(
         address = manager.token_mint_a,
@@ -468,13 +508,30 @@ pub struct Rebalance<'info> {
         constraint = token_vault_b.mint == token_mint_b.key()
     )]
     pub token_mint_b: Box<Account<'info, Mint>>,
-
     // External Programs
     pub raydium_program: AccountInfo<'info>,
     pub jupiter_program: AccountInfo<'info>,
-
-
 }
+
+#[derive(Accounts)]
+pub struct FundVaults<'info> {
+    #[account(mut)]
+    pub vault_a: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_b: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub payer_token_a: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub payer_token_b: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub mint_a: Account<'info, Mint>,
+    #[account(mut)]
+    pub mint_b: Account<'info, Mint>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
