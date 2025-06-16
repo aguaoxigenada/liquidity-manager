@@ -53,14 +53,31 @@ pub mod liquidity_manager {
 
     pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
         // 1. Get current pool state
-        let pool_data = ctx.accounts.pool.try_borrow_data()?.to_vec();
-        msg!("Raw pool data length: {}", pool_data.len());
 
+        // Debug: Print all accounts
+        msg!("Accounts received:");
+        for account in ctx.remaining_accounts.iter() {
+            msg!("- {} (writable: {}, signer: {})", 
+                account.key(), 
+                account.is_writable,
+                account.is_signer
+            );
+        }
+        
+        // Debug: Print pool account info
+        msg!("Attempting to deserialize pool data...");
+        let pool_data = ctx.accounts.pool.try_borrow_data()?.to_vec();
+        msg!("Raw data length: {}", pool_data.len());
+        
+        // Print first 32 bytes for debugging
+        let display_len = pool_data.len().min(32);
+        msg!("First {} bytes: {:?}", display_len, &pool_data[..display_len]);
+        
         let pool_state = pod_from_bytes::<RaydiumPoolState>(&pool_data)
-        .map_err(|e| {
-            msg!("Deserialization failed at offset: {:?}", e);
-            LiquidityManagerError::InvalidPoolData
-        })?;
+            .map_err(|e| {
+                msg!("Deserialization error: {:?}", e);
+                LiquidityManagerError::InvalidPoolData
+            })?;
         let current_tick = pool_state.current_tick;
 
         // 2. Check if rebalance is needed
@@ -176,6 +193,28 @@ pub mod liquidity_manager {
 #[test]
 fn test_struct_size() {
     println!("Struct size: {}", std::mem::size_of::<RaydiumPoolState>());
+}
+
+#[test]
+fn test_struct_layout() {
+    use std::mem;
+    println!("RaydiumPoolState size: {}", mem::size_of::<RaydiumPoolState>());
+    
+    // Manually verify offsets (less precise but works)
+    let dummy = RaydiumPoolState {
+        status: 0,
+        nonce: 0,
+        current_tick: 0,
+    };
+    
+    unsafe {
+        println!("Status offset: {}", 
+            (&dummy.status as *const _ as usize) - (&dummy as *const _ as usize));
+        println!("Nonce offset: {}", 
+            (&dummy.nonce as *const _ as usize) - (&dummy as *const _ as usize));
+        println!("Current tick offset: {}", 
+            (&dummy.current_tick as *const _ as usize) - (&dummy as *const _ as usize));
+    }
 }
 
 // revisar si esta funcion esta interna o externa.
