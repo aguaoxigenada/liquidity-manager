@@ -8,6 +8,7 @@ skip-lint = true
 
 [programs.localnet]
 liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"
+test_pool = "6nyHyzxQqGgUWquuvqfnusJNL6FHGmGTTcoRok4MZQ4q"
 
 [programs.devnet]
 liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"

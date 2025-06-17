@@ -51,10 +51,10 @@ pub mod liquidity_manager {
         Ok(())
     }
 
-    pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
-        // 1. Get current pool state
 
-        // Debug: Print all accounts
+
+    pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
+
         msg!("Accounts received:");
         for account in ctx.remaining_accounts.iter() {
             msg!("- {} (writable: {}, signer: {})", 
@@ -63,7 +63,33 @@ pub mod liquidity_manager {
                 account.is_signer
             );
         }
-        
+    
+        msg!("Attempting to manually deserialize pool data...");
+        let pool_data = ctx.accounts.pool.try_borrow_data()?;
+        msg!("Raw data length: {}", pool_data.len());
+    
+        let display_len = pool_data.len().min(32);
+        msg!("First {} bytes: {:?}", display_len, &pool_data[..display_len]);
+    
+        if pool_data.len() < 6 {
+            msg!("Error: Pool data too short");
+            return err!(LiquidityManagerError::InvalidPoolData);
+        }
+    
+        // Manual byte extraction
+        let status = pool_data[0];
+        let nonce = pool_data[1];
+        let current_tick = i32::from_le_bytes([pool_data[2], pool_data[3], pool_data[4], pool_data[5]]);
+    
+        msg!("Manually parsed Pool State => status: {}, nonce: {}, current_tick: {}", status, nonce, current_tick);
+    
+        // Now use current_tick as before
+        require!(
+            current_tick < ctx.accounts.manager.lower_tick || 
+            current_tick > ctx.accounts.manager.upper_tick,
+            LiquidityManagerError::NoRebalanceNeeded
+        );
+        /*    
         // Debug: Print pool account info
         msg!("Attempting to deserialize pool data...");
         let pool_data = ctx.accounts.pool.try_borrow_data()?.to_vec();
@@ -73,11 +99,21 @@ pub mod liquidity_manager {
         let display_len = pool_data.len().min(32);
         msg!("First {} bytes: {:?}", display_len, &pool_data[..display_len]);
         
+        
         let pool_state = pod_from_bytes::<RaydiumPoolState>(&pool_data)
             .map_err(|e| {
                 msg!("Deserialization error: {:?}", e);
                 LiquidityManagerError::InvalidPoolData
             })?;
+
+        let pool_state = deserialize_pool_state(&pool_data)
+            .map_err(|e| {
+                msg!("Deserialization error: {:?}", e);
+                LiquidityManagerError::InvalidPoolData
+            })?;
+            
+        msg!("Pool State current Tick: {}",  pool_state.current_tick);
+
         let current_tick = pool_state.current_tick;
 
         // 2. Check if rebalance is needed
@@ -86,7 +122,7 @@ pub mod liquidity_manager {
             current_tick > ctx.accounts.manager.upper_tick,
             LiquidityManagerError::NoRebalanceNeeded
         );
-    
+    */
         remove_liquidity(
             &ctx,
             ctx.accounts.manager.current_liquidity
@@ -355,12 +391,17 @@ fn remove_liquidity(
     ctx: &Context<Rebalance>,
     liquidity_to_remove: u128
 ) -> Result<()> {
+
+    msg!("¨Starting the removal of liquidity");
+
     // 1. Prepare instruction data
     let mut data = Vec::new();
     data.push(0x03); // DecreaseLiquidity discriminator
     data.extend_from_slice(&liquidity_to_remove.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // token_min_a
     data.extend_from_slice(&0u64.to_le_bytes()); // token_min_b
+
+    msg!("Finished preparation of instruction");
 
     // 2. Build instruction
     let ix = Instruction {
@@ -379,6 +420,8 @@ fn remove_liquidity(
         data,
     };
 
+    msg!("¨Build instruction complete");
+
     // 3. Execute CPI
     invoke(
         &ix,
@@ -394,6 +437,8 @@ fn remove_liquidity(
             ctx.accounts.token_program.to_account_info(),
         ],
     )?;
+
+    msg!("Completed CPI");
 
     Ok(())
 }
@@ -435,9 +480,25 @@ fn jupiter_swap_instruction(
         accounts: vec![
             AccountMeta::new(*input_mint, false),
             AccountMeta::new(*output_mint, false),
-            // Add other required accounts (user, token program, etc.)
         ],
         data,
+    })
+}
+
+fn deserialize_pool_state(data: &[u8]) -> Result<RaydiumPoolState> {
+    require!(
+        data.len() < 6,
+        LiquidityManagerError::InvalidAccountData
+    );
+
+    let status = data[0];
+    let nonce = data[1];
+    let current_tick = i32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+
+    Ok(RaydiumPoolState {
+        status,
+        nonce,
+        current_tick,
     })
 }
 
@@ -572,15 +633,16 @@ pub struct FundVaults<'info> {
 }
 
 
+//#[repr(C/*, packed)*/]
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
 pub struct RaydiumPoolState {
     pub status: u8,
     pub nonce: u8,
     pub current_tick: i32,  
 }
+/*
 unsafe impl Zeroable for RaydiumPoolState {}
-unsafe impl Pod for RaydiumPoolState {}
+unsafe impl Pod for RaydiumPoolState {}*/
 
 
 #[error_code]
@@ -596,5 +658,7 @@ pub enum LiquidityManagerError {
     #[msg("No Account Found")]
     AccountNotFound,
     #[msg("Tick is in invalid Range")]
-    InvalidTickRange
+    InvalidTickRange,
+    #[msg("Account Data is wrong")]
+    InvalidAccountData,
 }
