@@ -1,12 +1,18 @@
 use anchor_lang::{prelude::*, solana_program::{instruction::Instruction, program::invoke}};
 use anchor_spl::{
-    associated_token::AssociatedToken, token::{Mint, Token, TokenAccount}, token_interface::spl_pod::bytemuck 
-};
+    associated_token::AssociatedToken, memo::Memo, token::{Mint, Token, TokenAccount}, token_2022::Token2022};
 use anchor_lang::solana_program::account_info::AccountInfo;
-use ::bytemuck::{Pod, Zeroable};
-use bytemuck::{pod_from_bytes};
 
-pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey = pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");  // Should be in an .env
+use raydium_clmm_cpi::{cpi::accounts::DecreaseLiquidityV2, raydium_clmm};
+use raydium_clmm_cpi::raydium_clmm::decrease_liquidity_v2;
+use raydium_clmm_cpi::cpi::accounts::IncreaseLiquidityV2;
+use raydium_clmm_cpi::raydium_clmm::increase_liquidity_v2;
+use raydium_clmm_cpi::cpi::accounts::SwapSingleV2;
+use raydium_clmm_cpi::raydium_clmm::swap_v2;
+
+
+
+pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey = pubkey!("devi51mZmdwUJGU9hjN27vEz64Gps7uUefqxg27EAtH");
 
 declare_id!("BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq");
 
@@ -54,113 +60,63 @@ pub mod liquidity_manager {
 
 
     pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
-
-        msg!("Accounts received:");
-        for account in ctx.remaining_accounts.iter() {
-            msg!("- {} (writable: {}, signer: {})", 
-                account.key(), 
-                account.is_writable,
-                account.is_signer
-            );
-        }
+        // Scoped block to read tick only
+        let current_tick = {
+            let pool_data = ctx.accounts.pool.try_borrow_data()?;
+            if pool_data.len() < 6 {
+                return err!(LiquidityManagerError::InvalidPoolData);
+            }
+            let tick = i32::from_le_bytes(pool_data[2..6].try_into().unwrap());
+            msg!("Parsed current_tick = {}", tick);
+            tick
+        }; // borrow ends here
     
-        msg!("Attempting to manually deserialize pool data...");
-        let pool_data = ctx.accounts.pool.try_borrow_data()?;
-        msg!("Raw data length: {}", pool_data.len());
-    
-        let display_len = pool_data.len().min(32);
-        msg!("First {} bytes: {:?}", display_len, &pool_data[..display_len]);
-    
-        if pool_data.len() < 6 {
-            msg!("Error: Pool data too short");
-            return err!(LiquidityManagerError::InvalidPoolData);
-        }
-    
-        // Manual byte extraction
-        let status = pool_data[0];
-        let nonce = pool_data[1];
-        let current_tick = i32::from_le_bytes([pool_data[2], pool_data[3], pool_data[4], pool_data[5]]);
-    
-        msg!("Manually parsed Pool State => status: {}, nonce: {}, current_tick: {}", status, nonce, current_tick);
-    
-        // Now use current_tick as before
         require!(
-            current_tick < ctx.accounts.manager.lower_tick || 
-            current_tick > ctx.accounts.manager.upper_tick,
+            current_tick < ctx.accounts.manager.lower_tick || current_tick > ctx.accounts.manager.upper_tick,
             LiquidityManagerError::NoRebalanceNeeded
         );
-        /*    
-        // Debug: Print pool account info
-        msg!("Attempting to deserialize pool data...");
-        let pool_data = ctx.accounts.pool.try_borrow_data()?.to_vec();
-        msg!("Raw data length: {}", pool_data.len());
-        
-        // Print first 32 bytes for debugging
-        let display_len = pool_data.len().min(32);
-        msg!("First {} bytes: {:?}", display_len, &pool_data[..display_len]);
-        
-        
-        let pool_state = pod_from_bytes::<RaydiumPoolState>(&pool_data)
-            .map_err(|e| {
-                msg!("Deserialization error: {:?}", e);
-                LiquidityManagerError::InvalidPoolData
-            })?;
-
-        let pool_state = deserialize_pool_state(&pool_data)
-            .map_err(|e| {
-                msg!("Deserialization error: {:?}", e);
-                LiquidityManagerError::InvalidPoolData
-            })?;
-            
-        msg!("Pool State current Tick: {}",  pool_state.current_tick);
-
-        let current_tick = pool_state.current_tick;
-
-        // 2. Check if rebalance is needed
-        require!(
-            current_tick < ctx.accounts.manager.lower_tick || 
-            current_tick > ctx.accounts.manager.upper_tick,
-            LiquidityManagerError::NoRebalanceNeeded
-        );
-    */
-        remove_liquidity(
-            &ctx,
-            ctx.accounts.manager.current_liquidity
-        )?;
-
-        /*
-        swap_to_target_ratio(
-            ctx, 
-            current_tick
-        );
-         */
-
-         let swap_ix = jupiter_swap_instruction(
-            &ctx.accounts.token_vault_a.key(),
-            &ctx.accounts.token_vault_b.key(),
-            ctx.accounts.token_vault_a.amount, // Swap 100% of Token A
-            1,                                // Minimum out (adjust for slippage)
-            ctx.accounts.jupiter_program.key(),
-        )?;
-
-         // 2. Execute swap
-        invoke(
-            &swap_ix,
-            &[
-                ctx.accounts.token_vault_a.to_account_info(),
-                ctx.accounts.token_vault_b.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-            ],
-        )?;
+    
+        // Now borrows are released—safe to call remove_liquidity
+        remove_liquidity(&ctx, ctx.accounts.manager.current_liquidity)?;
 
         // 3. Calculate new ticks (centered around current price)
         let new_lower_tick = current_tick - 100;
         let new_upper_tick = current_tick + 100;
-    
+      
         // 4. Get token amounts from vaults
-        let token_a_amount = ctx.accounts.token_vault_a.amount;
-        let token_b_amount = ctx.accounts.token_vault_b.amount;
-    
+        let token_a_amount = ctx.accounts.token_account_0.amount;
+        let token_b_amount = ctx.accounts.token_account_0.amount;
+
+        let swap_accounts = SwapSingleV2 {
+            amm_config: ctx.accounts.position_nft_mint.clone(),
+            pool_state: ctx.accounts.pool.clone(),
+            payer: ctx.accounts.payer.to_account_info(),
+            input_vault: ctx.accounts.input_vault.to_account_info(),
+            output_vault: ctx.accounts.output_vault.to_account_info(),
+            input_token_account: ctx.accounts.input_token_account.to_account_info(),
+            output_token_account: ctx.accounts.output_token_account.to_account_info(),
+            observation_state: ctx.accounts.observation_state.clone(),
+            token_program: ctx.accounts.token_program.to_account_info(),
+            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+            memo_program: ctx.accounts.memo_program.to_account_info(),
+            input_vault_mint: ctx.accounts.input_vault_mint.clone(),
+            output_vault_mint: ctx.accounts.output_vault_mint.clone(),
+        };
+        
+        let swap_ctx = CpiContext::new(
+            ctx.accounts.raydium_program.to_account_info(),
+            swap_accounts,
+        );
+        
+        // Swap the full amount from vault A to vault B
+        raydium_clmm_cpi::cpi::swap_v2(
+            swap_ctx,
+            token_a_amount,     // amount in
+            0,                  // minimum amount out (slippage protection)
+            u128::MAX,          // no sqrt price limit
+            true,               // is_base_input: true if swapping from base to quote
+        )?;
+            
         // 5. Calculate liquidity parameters
         let liquidity = calculate_liquidity(
             new_lower_tick,
@@ -171,7 +127,6 @@ pub mod liquidity_manager {
             ctx.accounts.token_mint_a.decimals, // Add token A decimals
             ctx.accounts.token_mint_b.decimals, // Add token B decimals
         )?;
-
 
         // 6. Add 10% slippage buffer
         let token_a_max = token_a_amount.checked_mul(110).unwrap() / 100;
@@ -186,7 +141,7 @@ pub mod liquidity_manager {
             token_a_max,
             token_b_max
         )?;
-    
+         
         // 8. Update manager state
         let manager = &mut ctx.accounts.manager;
         manager.lower_tick = new_lower_tick;
@@ -226,35 +181,7 @@ pub mod liquidity_manager {
     }
 }
 
-#[test]
-fn test_struct_size() {
-    println!("Struct size: {}", std::mem::size_of::<RaydiumPoolState>());
-}
-
-#[test]
-fn test_struct_layout() {
-    use std::mem;
-    println!("RaydiumPoolState size: {}", mem::size_of::<RaydiumPoolState>());
-    
-    // Manually verify offsets (less precise but works)
-    let dummy = RaydiumPoolState {
-        status: 0,
-        nonce: 0,
-        current_tick: 0,
-    };
-    
-    unsafe {
-        println!("Status offset: {}", 
-            (&dummy.status as *const _ as usize) - (&dummy as *const _ as usize));
-        println!("Nonce offset: {}", 
-            (&dummy.nonce as *const _ as usize) - (&dummy as *const _ as usize));
-        println!("Current tick offset: {}", 
-            (&dummy.current_tick as *const _ as usize) - (&dummy as *const _ as usize));
-    }
-}
-
-// revisar si esta funcion esta interna o externa.
-pub fn add_liquidity_cpi(
+fn add_liquidity_cpi(
     ctx: &Context<Rebalance>,
     lower_tick: i32,
     upper_tick: i32,
@@ -262,51 +189,39 @@ pub fn add_liquidity_cpi(
     token_max_a: u64,
     token_max_b: u64,
 ) -> Result<()> {
-
-    let mut data = vec![0x02]; // IncreaseLiquidity discriminator
-    data.extend_from_slice(&lower_tick.to_le_bytes());
-    data.extend_from_slice(&upper_tick.to_le_bytes());
-    data.extend_from_slice(&liquidity_amount.to_le_bytes());
-    data.extend_from_slice(&token_max_a.to_le_bytes());
-    data.extend_from_slice(&token_max_b.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: RAYDIUM_CLMM_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(ctx.accounts.pool.key(), false),
-            AccountMeta::new(ctx.accounts.position_authority.key(), true),
-            AccountMeta::new(ctx.accounts.position_nft_mint.key(), false),
-            AccountMeta::new(ctx.accounts.position_token_account.key(), false),
-            AccountMeta::new(ctx.accounts.tick_array_lower.key(), false),
-            AccountMeta::new(ctx.accounts.tick_array_upper.key(), false),
-            AccountMeta::new(ctx.accounts.token_owner_account_a.key(), false),
-            AccountMeta::new(ctx.accounts.token_owner_account_b.key(), false),
-            AccountMeta::new(ctx.accounts.token_vault_a.key(), false),
-            AccountMeta::new(ctx.accounts.token_vault_b.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-        ],
-        data,
+    let cpi_accounts = IncreaseLiquidityV2 {
+        nft_owner: ctx.accounts.nft_owner.to_account_info(),
+        nft_account: ctx.accounts.nft_account.clone(),
+        pool_state: ctx.accounts.pool_state.clone(),
+        protocol_position: ctx.accounts.protocol_position.clone(),
+        personal_position: ctx.accounts.personal_position.clone(),
+        tick_array_lower: ctx.accounts.tick_array_lower.clone(),
+        tick_array_upper: ctx.accounts.tick_array_upper.clone(),
+        token_account_0: ctx.accounts.token_account_0.to_account_info(),
+        token_account_1: ctx.accounts.token_account_1.to_account_info(),
+        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
+        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+        vault_0_mint: ctx.accounts.vault_0_mint.clone(),
+        vault_1_mint: ctx.accounts.vault_1_mint.clone(),
     };
 
-    invoke(
-        &ix,
-        &[
-            ctx.accounts.pool.to_account_info(),
-            ctx.accounts.position_authority.to_account_info(),
-            ctx.accounts.position_nft_mint.to_account_info(),
-            ctx.accounts.position_token_account.to_account_info(),
-            ctx.accounts.tick_array_lower.to_account_info(),
-            ctx.accounts.tick_array_upper.to_account_info(),
-            ctx.accounts.token_owner_account_a.to_account_info(),
-            ctx.accounts.token_owner_account_b.to_account_info(),
-            ctx.accounts.token_vault_a.to_account_info(),
-            ctx.accounts.token_vault_b.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
-        ],
-    )?;
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.raydium_program.to_account_info(),
+        cpi_accounts,
+    );
 
+    raydium_clmm_cpi::cpi::increase_liquidity_v2(
+        cpi_ctx,
+        liquidity_amount,
+        token_max_a,
+        token_max_b,
+        Some(true), // or Some(false) or None depending on your logic
+    )?;
     Ok(())
 }
+
 
 // Helper function (simplified)
 fn calculate_liquidity(
@@ -387,119 +302,35 @@ fn adjust_for_decimals(amount: u64, decimals: u8) -> Result<u128> {
     Ok(amount as u128 * 10u128.pow(decimals as u32))
 }
 
-fn remove_liquidity(
-    ctx: &Context<Rebalance>,
-    liquidity_to_remove: u128
-) -> Result<()> {
+fn remove_liquidity(ctx: &Context<Rebalance>, liquidity_to_remove: u128) -> Result<()> {
+    let cpi_accounts = DecreaseLiquidityV2 {
+        nft_owner: ctx.accounts.nft_owner.to_account_info(),
+        nft_account: ctx.accounts.nft_account.clone(),
+        pool_state: ctx.accounts.pool_state.clone(),
+        protocol_position: ctx.accounts.protocol_position.clone(),
+        personal_position: ctx.accounts.personal_position.clone(),
+        tick_array_lower: ctx.accounts.tick_array_lower.clone(),
+        tick_array_upper: ctx.accounts.tick_array_upper.clone(),
+        recipient_token_account_0: ctx.accounts.token_account_0.to_account_info(),
+        recipient_token_account_1: ctx.accounts.token_account_1.to_account_info(),
+        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
+        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+        vault_0_mint: ctx.accounts.vault_0_mint.clone(),
+        vault_1_mint: ctx.accounts.vault_1_mint.clone(),
+        memo_program: ctx.accounts.memo_program.to_account_info(),
 
-    msg!("¨Starting the removal of liquidity");
-
-    // 1. Prepare instruction data
-    let mut data = Vec::new();
-    data.push(0x03); // DecreaseLiquidity discriminator
-    data.extend_from_slice(&liquidity_to_remove.to_le_bytes());
-    data.extend_from_slice(&0u64.to_le_bytes()); // token_min_a
-    data.extend_from_slice(&0u64.to_le_bytes()); // token_min_b
-
-    msg!("Finished preparation of instruction");
-
-    // 2. Build instruction
-    let ix = Instruction {
-        program_id: RAYDIUM_CLMM_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(ctx.accounts.pool.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.executor.key(), true),
-            AccountMeta::new(ctx.accounts.position_nft_mint.key(), false),
-            AccountMeta::new(ctx.accounts.position_token_account.key(), false),
-            AccountMeta::new(ctx.accounts.token_vault_a.key(), false),
-            AccountMeta::new(ctx.accounts.token_vault_b.key(), false),
-            AccountMeta::new(ctx.accounts.pool_token_vault_a.key(), false),
-            AccountMeta::new(ctx.accounts.pool_token_vault_b.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-        ],
-        data,
     };
 
-    msg!("¨Build instruction complete");
+    let cpi_ctx = CpiContext::new(ctx.accounts.raydium_program.clone(), cpi_accounts);
 
-    // 3. Execute CPI
-    invoke(
-        &ix,
-        &[
-            ctx.accounts.pool.to_account_info(),
-            ctx.accounts.executor.to_account_info(),
-            ctx.accounts.position_nft_mint.to_account_info(),
-            ctx.accounts.position_token_account.to_account_info(),
-            ctx.accounts.token_vault_a.to_account_info(),
-            ctx.accounts.token_vault_b.to_account_info(),
-            ctx.accounts.pool_token_vault_a.to_account_info(),
-            ctx.accounts.pool_token_vault_b.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
-        ],
-    )?;
-
-    msg!("Completed CPI");
-
-    Ok(())
-}
-
-pub fn swap_to_target_ratio(
-    ctx: Context<Rebalance>,
-    swap_ix_data: Vec<u8>,
-) -> Result<()> {
-    invoke(
-        &Instruction {
-            program_id: ctx.accounts.jupiter_program.key(),
-            accounts: ctx.remaining_accounts.iter()
-                .map(|a| AccountMeta {
-                    pubkey: a.key(),
-                    is_signer: a.is_signer,
-                    is_writable: a.is_writable,
-                })
-                .collect(),
-            data: swap_ix_data,
-        },
-        ctx.remaining_accounts,
-    )?;
-    Ok(())
-}
-
-fn jupiter_swap_instruction(
-    input_mint: &Pubkey,
-    output_mint: &Pubkey,
-    amount_in: u64,
-    min_amount_out: u64,
-    jupiter_program: Pubkey,
-) -> Result<Instruction> {
-    let mut data = vec![0x01]; // Jupiter swap instruction discriminator
-    data.extend_from_slice(&amount_in.to_le_bytes());
-    data.extend_from_slice(&min_amount_out.to_le_bytes());
-
-    Ok(Instruction {
-        program_id: jupiter_program,
-        accounts: vec![
-            AccountMeta::new(*input_mint, false),
-            AccountMeta::new(*output_mint, false),
-        ],
-        data,
-    })
-}
-
-fn deserialize_pool_state(data: &[u8]) -> Result<RaydiumPoolState> {
-    require!(
-        data.len() < 6,
-        LiquidityManagerError::InvalidAccountData
-    );
-
-    let status = data[0];
-    let nonce = data[1];
-    let current_tick = i32::from_le_bytes([data[2], data[3], data[4], data[5]]);
-
-    Ok(RaydiumPoolState {
-        status,
-        nonce,
-        current_tick,
-    })
+    raydium_clmm_cpi::cpi::decrease_liquidity_v2(
+        cpi_ctx,
+        liquidity_to_remove,
+        0, // min_token_a
+        0, // min_token_b
+    )
 }
 
 #[account]
@@ -563,54 +394,98 @@ pub struct UpdateRange<'info> {
 
 #[derive(Accounts)]
 pub struct Rebalance<'info> {
-    // Core Program Accounts
+    // Programs
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+    pub memo_program: Program<'info, Memo>,
     pub rent: Sysvar<'info, Rent>,
-    // Authority Accounts
+
+    // Authority
     #[account(mut, has_one = executor)]
     pub manager: Account<'info, LiquidityManager>,
     pub executor: Signer<'info>,
     pub position_authority: Signer<'info>,
-    // Pool & Position Accounts
+    pub nft_owner: Signer<'info>,
+
+    // Core Raydium Positioning
     #[account(mut)]
     pub pool: AccountInfo<'info>,
+    #[account(mut)]
+    pub pool_state: AccountInfo<'info>,
+    #[account(mut)]
+    pub protocol_position: AccountInfo<'info>,
+    #[account(mut)]
+    pub personal_position: AccountInfo<'info>,
     #[account(mut)]
     pub position_nft_mint: AccountInfo<'info>,
     #[account(mut)]
     pub position_token_account: AccountInfo<'info>,
-    // Tick Arrays
+    #[account(mut)]
+    pub nft_account: AccountInfo<'info>,
+
+    // Ticks
+    #[account(mut)]
     pub tick_array_lower: AccountInfo<'info>,
+    #[account(mut)]
     pub tick_array_upper: AccountInfo<'info>,
-    // Token Vaults (Yours)
     #[account(mut)]
-    pub token_vault_a: Account<'info, TokenAccount>,
+    pub tick_array_lower_ext: AccountInfo<'info>,
     #[account(mut)]
-    pub token_vault_b: Account<'info, TokenAccount>,
+    pub tick_array_upper_ext: AccountInfo<'info>,
+
+    // Token logic
+    #[account(mut)]
+    pub token_account_0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub token_account_1: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub token_vault_0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub token_vault_1: Account<'info, TokenAccount>,
     #[account(mut)]
     pub token_owner_account_a: AccountInfo<'info>,
     #[account(mut)]
     pub token_owner_account_b: AccountInfo<'info>,
-    // Pool Token Vaults (Raydium's)
-    #[account(mut)]
-    pub pool_token_vault_a: AccountInfo<'info>,
-    #[account(mut)]
-    pub pool_token_vault_b: AccountInfo<'info>,
-    // Token Mints
+
     #[account(
         address = manager.token_mint_a,
-        constraint = token_vault_a.mint == token_mint_a.key()
+        constraint = token_vault_0.mint == token_mint_a.key()
     )]
     pub token_mint_a: Box<Account<'info, Mint>>,
 
     #[account(
         address = manager.token_mint_b,
-        constraint = token_vault_b.mint == token_mint_b.key()
+        constraint = token_vault_1.mint == token_mint_b.key()
     )]
     pub token_mint_b: Box<Account<'info, Mint>>,
-    // External Programs
+
+    pub vault_0_mint: AccountInfo<'info>,
+    pub vault_1_mint: AccountInfo<'info>,
+
+    /// Swap authority paying for the transaction
+    pub payer: Signer<'info>,
+
+    /// User-side SPL accounts for swap
+    #[account(mut)]
+    pub input_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_token_account: Account<'info, TokenAccount>,
+
+    /// Vault mint accounts
+    pub input_vault_mint: AccountInfo<'info>,
+    pub output_vault_mint: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub observation_state: AccountInfo<'info>,
+
+    // External CPI Target
     pub raydium_program: AccountInfo<'info>,
-    pub jupiter_program: AccountInfo<'info>,
+ 
 }
 
 #[derive(Accounts)]
@@ -632,18 +507,12 @@ pub struct FundVaults<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-
-//#[repr(C/*, packed)*/]
 #[derive(Debug, Clone, Copy)]
 pub struct RaydiumPoolState {
     pub status: u8,
     pub nonce: u8,
     pub current_tick: i32,  
 }
-/*
-unsafe impl Zeroable for RaydiumPoolState {}
-unsafe impl Pod for RaydiumPoolState {}*/
-
 
 #[error_code]
 pub enum LiquidityManagerError {

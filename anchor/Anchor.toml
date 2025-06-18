@@ -9,6 +9,8 @@ skip-lint = true
 [programs.localnet]
 liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"
 test_pool = "6nyHyzxQqGgUWquuvqfnusJNL6FHGmGTTcoRok4MZQ4q"
+mock_raydium = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+mock_jupiter = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 
 [programs.devnet]
 liquidity_manager = "BqNn2BhDXSvHPgNB9XQWrysvMRkDyChUBnVuhRHTz3Eq"
